@@ -1,18 +1,61 @@
-﻿namespace Interactive;
+﻿using System.Diagnostics.SymbolStore;
 
-public class InteractiveCommand(string primaryCommand, string[] args)
+namespace Interactive;
+
+public class InteractiveCommand
 {
-    public string PrimaryCommand { get; } = primaryCommand;
+    public string PrimaryCommand { get; }
 
-    public string[] Args { get; } = args;
+    public string[] Args { get; }
 
     const char Quote1 = '"';
     const char Quote2 = '\'';
     const char Quote3 = '`';
     const char EscapeChar = '\\';
 
-    public static InteractiveCommand Parse(string input)
+    private readonly Dictionary<string, string> _namedArgs = [];
+
+    public InteractiveCommand(string primaryCommand, string[] args)
     {
+        PrimaryCommand = primaryCommand;
+        Args = args;
+        MapArgs();
+    }
+
+    private void MapArgs()
+    {
+        string? name = null;
+        for (int i = 0; i < Args.Length; i++)
+        {
+            var arg = Args[i];
+            if (arg.StartsWith('-'))
+            {
+                if (name is not null)
+                {
+                    // 上一个参数是标记，没有值
+                    _namedArgs[name] = "true"; // 转换为开关
+                }
+                name = arg.TrimStart('-');
+                continue;
+            }
+
+            if (name is not null)
+            {
+                _namedArgs[name] = arg;
+                name = null;
+            }
+        }
+
+        if (name is not null)
+        {
+            // 上一个参数是标记，没有值
+            _namedArgs[name] = "true"; // 转换为开关
+        }
+    }
+
+    public static List<InteractiveCommand> ParsePipeline(string input)
+    {
+        var commands = new List<InteractiveCommand>();
         var index = input.IndexOf(' ');
         var primaryCommand = index == -1 ? input : input[..index];
 
@@ -91,6 +134,41 @@ public class InteractiveCommand(string primaryCommand, string[] args)
                 continue;
             }
 
+            if (c == '|')
+            {
+                if (quoteChar != '\0')
+                {
+                    sb.Append(c); // 引号内的管道符作为普通字符处理
+                    continue;
+                }
+                // 管道符，结束当前命令
+                if (sb.Length > 0)
+                {
+                    args.Add(sb.ToString());
+                    sb.Clear();
+                }
+                commands.Add(new InteractiveCommand(primaryCommand, [.. args]));
+                args.Clear();
+                // 读取下一个命令的主命令
+                while (currentCharIndex < argsPart.Length && char.IsWhiteSpace(argsPart[currentCharIndex]))
+                {
+                    currentCharIndex++;
+                }
+
+                var nextCommandStart = currentCharIndex;
+
+                while (currentCharIndex < argsPart.Length && !char.IsWhiteSpace(argsPart[currentCharIndex]) && argsPart[currentCharIndex] != '|')
+                {
+                    currentCharIndex++;
+                }
+
+                if (nextCommandStart == currentCharIndex)
+                    throw new FormatException("无效的命令格式");
+
+                primaryCommand = argsPart[nextCommandStart..currentCharIndex];
+                continue;
+            }
+
             sb.Append(c);
         }
 
@@ -102,7 +180,9 @@ public class InteractiveCommand(string primaryCommand, string[] args)
             args.Add(sb.ToString());
         }
 
-        return new InteractiveCommand(primaryCommand, [.. args]);
+        commands.Add(new InteractiveCommand(primaryCommand, [.. args]));
+
+        return commands;
     }
 
     private static char ReadEscapedUnicode(string argsPart, ref ushort currentCharIndex)
@@ -116,14 +196,26 @@ public class InteractiveCommand(string primaryCommand, string[] args)
         return (char)code;
     }
 
-    internal bool TryGet(int index, out string value)
+    public bool TryGet(int index, out string? value)
     {
         if (index < 0 || index >= Args.Length)
         {
-            value = string.Empty;
+            value = null;
             return false;
         }
         value = Args[index];
         return true;
+    }
+
+    public bool TryGet(string name, out string? value)
+    {
+        return _namedArgs.TryGetValue(name, out value);
+    }
+
+    public bool IsMapped => _namedArgs.Count > 0;
+
+    public bool HasFlag(string name)
+    {
+        return _namedArgs.ContainsKey(name);
     }
 }
