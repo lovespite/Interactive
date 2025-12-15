@@ -72,6 +72,25 @@ public static class ParameterDeserializer
     public static object? ObjectArray(string parameterExpr) => ObjectEnumerable(parameterExpr) is IEnumerable<object> parts ? parts.ToArray() : null;
     public static object? ObjectList(string parameterExpr) => ObjectEnumerable(parameterExpr) is IEnumerable<object> parts ? parts.ToList() : null;
 
+    public static object? KeyValuePair(string parameterExpr)
+    {
+        var parts = parameterExpr.Split('=', 2, StringSplitOptions.TrimEntries);
+        if (parts.Length != 2) throw new FormatException($"Cannot convert '{parameterExpr}' to KeyValuePair.");
+        return new KeyValuePair<string, object?>(parts[0], parts[1]);
+    }
+
+    public static object? KeyValuePairEnumerable(string parameterExpr)
+    {
+        var parts = parameterExpr
+            .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Select(x => (KeyValuePair<string, object?>)KeyValuePair(x.Trim())!);
+        return parts;
+    }
+
+    public static object? KeyValuePairArray(string parameterExpr) => KeyValuePairEnumerable(parameterExpr) is IEnumerable<KeyValuePair<string, object?>> parts ? parts.ToArray() : null;
+
+    public static object? KeyValuePairList(string parameterExpr) => KeyValuePairEnumerable(parameterExpr) is IEnumerable<KeyValuePair<string, object?>> parts ? parts.ToList() : null;
+
     public delegate object? ParamterDeserializer(string parameterExpr);
 
     private static readonly Dictionary<Type, ParamterDeserializer> _typeMap = new()
@@ -105,6 +124,11 @@ public static class ParameterDeserializer
         { typeof(IEnumerable<object>), ObjectEnumerable },
         { typeof(object[]), ObjectArray },
         { typeof(List<object>), ObjectList },
+
+        { typeof(KeyValuePair<string, object?>), KeyValuePair },
+        { typeof(IEnumerable<KeyValuePair<string, object?>>), KeyValuePairEnumerable },
+        { typeof(KeyValuePair<string, object?>[]), KeyValuePairArray },
+        { typeof(List<KeyValuePair<string, object?>>), KeyValuePairList },
     };
 
     public static ParamterDeserializer? FromTypeOf(Type t)

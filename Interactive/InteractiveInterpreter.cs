@@ -367,16 +367,29 @@ public class InteractiveInterpreter : IDisposable
     #region Built-in Functions
 
     [InteractiveFunction(Description = "查看所有可用的命令")]
-    public void Help()
+    public void Help(string? keyword = null)
     {
         Console.PrintLine("Available commands:");
         foreach (var fn in _functions)
         {
             var parameters = fn.Value.Item2.GetParameters();
+            var attr = fn.Value.Item2.GetCustomAttribute<InteractiveFunctionAttribute>();
+
+            if (keyword is not null)
+            {
+                if (
+                    !fn.Key.Contains(keyword, StringComparison.OrdinalIgnoreCase) &&
+                    (attr?.Description is null || !attr.Description.Contains(keyword, StringComparison.OrdinalIgnoreCase)) &&
+                    (attr?.Alias is null || !attr.Alias.Contains(keyword, StringComparison.OrdinalIgnoreCase))
+                    )
+                {
+                    continue;
+                }
+            }
+
             var parameterExpr = string.Join(" ", parameters.Select(p => p.IsOptional ? $"[{p.Name}]" : $"<{p.Name}>"));
             Console.Print($"- {fn.Key.ToLowerInvariant()} {parameterExpr}");
 
-            var attr = fn.Value.Item2.GetCustomAttribute<InteractiveFunctionAttribute>();
             if (attr?.Description is not null)
             {
                 Console.PrintLow($"  {attr.Description}");
