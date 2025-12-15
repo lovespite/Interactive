@@ -660,7 +660,14 @@ public class InteractiveInterpreter : IDisposable
 
     private PropertyInfo? GetProperty(string propName)
     {
-        return this.GetType().GetProperty(propName, BindingFlags.Public | BindingFlags.Instance | BindingFlags.IgnoreCase);
+        return GetPropertyCore<InteractiveInterpreter>(propName);
+    }
+
+    private static PropertyInfo? GetPropertyCore<
+        [DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.AllProperties)] T>(
+    string propName)
+    {
+        return typeof(T).GetProperty(propName, BindingFlags.Public | BindingFlags.Instance | BindingFlags.IgnoreCase);
     }
 
     #endregion
