@@ -1,14 +1,13 @@
-﻿using Interactive.Utilities;
-using Interactive.Attributes;
+﻿using Interactive.Attributes;
+using Interactive.Utilities;
 using System.Diagnostics.CodeAnalysis;
+using System.Net;
 using System.Reflection;
 using System.Text;
-using System.IO.Pipes;
-using System.Runtime.CompilerServices;
-using System.ComponentModel;
 
 namespace Interactive;
 
+[DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicProperties)]
 public class InteractiveInterpreter : IDisposable
 {
     public void Dispose()
@@ -29,6 +28,8 @@ public class InteractiveInterpreter : IDisposable
     private bool HasBufferedText => _buffer.Length > 0;
     private volatile bool _disposed = false;
 
+    public bool AllowSearchSystemEnvironmentVariables { get; set; } = true;
+
     public InteractiveInterpreter() => RegisterFunction(this);
 
     public async Task Start()
@@ -43,7 +44,7 @@ public class InteractiveInterpreter : IDisposable
         {
             try
             {
-                commandText = Console.GetInputLine().TrimEnd();
+                commandText = Console.GetInputLine().Trim();
                 if (_disposed) break;
 
                 if (string.IsNullOrWhiteSpace(commandText) && !HasBufferedText)
@@ -65,33 +66,11 @@ public class InteractiveInterpreter : IDisposable
                 // 解析命令管线
                 pipeline = InteractiveCommand.ParsePipeline(commandText);
 
-                // 检查命令是否存有效
-                string? unknownCommand = pipeline.FirstOrDefault(x => !HasMethod(x.PrimaryCommand))?.PrimaryCommand;
-                if (unknownCommand is not null)
-                {
-                    Console.PrintError($"Unknown command('{unknownCommand}') in pipeline.");
-                    continue;
-                }
-
                 // 执行管线
                 var ret = await ExecutePipeline(pipeline);
 
                 // 输出
-                if (ret is not null)
-                {
-                    if (ret is IEnumerable<object?> objects)
-                    {
-                        Console.PrintLine(objects.FormatPrint());
-                    }
-                    else if (ret is IEnumerable<KeyValuePair<string, string>> kvPairs)
-                    {
-                        Console.PrintLine(kvPairs.FormatPrint());
-                    }
-                    else
-                    {
-                        Console.PrintLine(ret);
-                    }
-                }
+                PrintResult(ret);
             }
             catch (FormatException ex)
             {
@@ -117,31 +96,47 @@ public class InteractiveInterpreter : IDisposable
         }
     }
 
+    private static void PrintResult(object? ret)
+    {
+        if (ret is null) return;
+
+        if (ret is IEnumerable<object?> objects)
+        {
+            Console.PrintLine(objects.FormatPrint());
+        }
+        else if (ret is IEnumerable<KeyValuePair<string, object?>> kvPairs)
+        {
+            Console.PrintLine(kvPairs.FormatPrint());
+        }
+        else
+        {
+            Console.PrintLine(ret);
+        }
+    }
+
     private async Task<object?> ExecutePipeline(List<InteractiveCommand> pipeline)
     {
         object? pipeInput = null;
         for (int ptr = 0; ptr < pipeline.Count; ++ptr)
         {
             var cmd = pipeline[ptr];
+            cmd.MapVariables(_contextlVariables, AllowSearchSystemEnvironmentVariables);
+
             var (Instance, Method) = GetMethodByName(cmd.PrimaryCommand);
+
             var parameters = MapParameters(Method.GetParameters(), cmd, pipeInput);
 
             var ret = Method.Invoke(Instance, parameters);
 
-            if (ret is null)
-            {
-                pipeInput = null;
-            }
-            else
-            {
-                pipeInput = await GetRealResult(ret);
-            }
+            pipeInput = await GetRealResult(ret);
         }
         return pipeInput;
     }
 
     private static async Task<object?> GetRealResult(object? ret)
     {
+        if (ret is null) return null;
+
         if (ret is Task<object?> task)
         {
             return await task;
@@ -175,10 +170,57 @@ public class InteractiveInterpreter : IDisposable
 
     private object?[]? MapParametersByName(ParameterInfo[] pInfoArr, InteractiveCommand ic, object? pipeIn = null)
     {
+        static string AsVarName(int index) => $"$__default_parameter_{index}";
+
         Dictionary<string, object?> parameters = [];
         Dictionary<string, string> alias = [];
 
-        return [.. parameters.ToSortedList(pInfoArr.Select(p => p.Name!))];
+        foreach (var (index, pInfo) in pInfoArr.Index())
+        {
+            var pInfoAttr = pInfo.GetCustomAttribute<InteractiveParameterAttribute>();
+            var parameterName = pInfo.Name ?? AsVarName(index);
+            string? parameterAliasName = null;
+
+            if (pInfoAttr?.Alias is string a)
+            {
+                alias[a] = parameterAliasName = parameterName;
+            }
+
+            if (pInfoAttr?.PipeIn == true && pipeIn is not null)
+            {
+                parameters[parameterName] = pipeIn;
+                continue;
+            }
+
+            if (ic.TryGet(parameterName, out string? parameterValueRaw) ||
+                (parameterAliasName is not null && ic.TryGet(parameterAliasName, out parameterValueRaw)))
+            {
+                var converter = ParameterDeserializer.FromTypeOf(pInfo.ParameterType)
+                                ?? throw new ArgumentException($"No converter found for parameter type '{pInfo.ParameterType.Name}'");
+                try
+                {
+                    parameters[parameterName] = parameterValueRaw is null ? null : converter(parameterValueRaw);
+                }
+                catch (Exception innerEx)
+                {
+                    throw new ArgumentException($"Failed to convert parameter '{parameterName}' to type '{pInfo.ParameterType.Name}'", innerEx);
+                }
+            }
+            else
+            {
+                if (pInfo.IsOptional && pInfo.HasDefaultValue)
+                {
+                    parameters[parameterName] = pInfo.DefaultValue;
+                    continue;
+                }
+                else
+                {
+                    throw new ArgumentException($"Missing parameter '{parameterName}' for function '{ic.PrimaryCommand}'.");
+                }
+            }
+        }
+
+        return [.. parameters.ToSortedList(pInfoArr.Select((p, i) => p?.Name ?? AsVarName(i)))];
     }
 
     private object?[]? MapParametersByIndex(ParameterInfo[] pInfoArr, InteractiveCommand ic, object? pipeIn = null)
@@ -356,7 +398,7 @@ public class InteractiveInterpreter : IDisposable
                     {
                         Console.Print($"    · {p.Name}: {p.ParameterType.Name} [Optional");
                         if (p.HasDefaultValue)
-                            Console.Print($", default = {p.DefaultValue ?? "null"}]");
+                            Console.Print($", default = {paramAttr?.DefaultValueDisplayText ?? p.DefaultValue ?? "null"}]");
                         else
                             Console.Print("]");
                     }
@@ -446,26 +488,61 @@ public class InteractiveInterpreter : IDisposable
         return string.Join(newLine, matchedLines.Select(x => x.Trim()));
     }
 
-    [InteractiveFunction(Name = "println", Description = "格式化输出集合")]
+    [InteractiveFunction(Name = "printc", Description = "格式化输出集合")]
     public string PrintCollection(
-        [InteractiveParameter(PipeIn = true)] IEnumerable<object?> input,
+        [InteractiveParameter(Description = "集合，支持键值对集合、对象集合", PipeIn = true)] object input,
         [InteractiveParameter(Description = "分隔符", DefaultValueDisplayText = "\\n")] string? separator = "\n",
         [InteractiveParameter(Description = "忽略空项目")] bool ignoreNull = true)
     {
         var sb = new StringBuilder();
-        foreach (var o in input)
+
+        if (input is IEnumerable<KeyValuePair<string, object?>> kvPairs)
         {
-            if (ignoreNull && o is null) continue;
-            sb.Append(Convert.ToString(o)).Append(separator);
+            foreach (var kv in kvPairs)
+            {
+                sb.Append(kv.Key)
+                    .Append(" = ")
+                    .AppendLine(Convert.ToString(kv.Value));
+            }
         }
-        return sb.ToString();
+        else if (input is IEnumerable<object?> enumerable)
+        {
+            foreach (var o in enumerable)
+            {
+                if (ignoreNull && o is null) continue;
+                sb.Append(Convert.ToString(o)).Append(separator);
+            }
+        }
+        else if (input is string textArr)
+        {
+            sb.Append(textArr);
+        }
+
+        return sb.ToString().TrimEnd();
+    }
+
+    [InteractiveFunction(Name = "println", Description = "格式化输出对象集合")]
+    public string PrintCollection(
+    [InteractiveParameter(Description = "对象集合", PipeIn = true)] IEnumerable<object?> input,
+    [InteractiveParameter(Description = "分隔符", DefaultValueDisplayText = "\\n")] string? separator = "\n",
+    [InteractiveParameter(Description = "忽略空项目")] bool ignoreNull = true)
+    {
+        var sb = new StringBuilder();
+
+        foreach (var item in input)
+        {
+            if (ignoreNull && item is null) continue;
+            sb.Append(Convert.ToString(item)).Append(separator);
+        }
+
+        return sb.ToString().TrimEnd();
     }
 
     [InteractiveFunction(Description = "以特定分隔符切割字符串")]
     public string[] Split(
         [InteractiveParameter(Description = "输入字符串", PipeIn = true)] string input,
-        [InteractiveParameter(Description = "分隔符")] string separetor, 
-        [InteractiveParameter(Description = "最大分割数量")] int maxCount = int.MaxValue, 
+        [InteractiveParameter(Description = "分隔符")] string separetor,
+        [InteractiveParameter(Description = "最大分割数量")] int maxCount = int.MaxValue,
         [InteractiveParameter(Description = "是否移除空项")] bool removeEmpty = true,
         [InteractiveParameter(Description = "是否移除前后空字符")] bool trimEntry = true)
     {
@@ -478,16 +555,261 @@ public class InteractiveInterpreter : IDisposable
     }
 
     #endregion
+
+    #region Context Self Management
+
+    [InteractiveFunction(Description = "启用指定属性", Name = "prop-enable")]
+    public string EnableProperty([InteractiveParameter(Description = "属性名称", PipeIn = true)] string propName)
+    {
+        var prop = GetProperty(propName)
+                   ?? throw new ArgumentException($"Property '{propName}' not found.", nameof(propName));
+
+        if (prop.PropertyType != typeof(bool))
+        {
+            throw new ArgumentException($"Property '{propName}' is not of type bool.", nameof(propName));
+        }
+
+        prop.SetValue(this, true);
+        return $"Property '{propName}' enabled.";
+    }
+
+    [InteractiveFunction(Description = "禁用指定属性", Name = "prop-disable")]
+    public string DisableProperty([InteractiveParameter(Description = "属性名称", PipeIn = true)] string propName)
+    {
+        var prop = GetProperty(propName)
+                   ?? throw new ArgumentException($"Property '{propName}' not found.", nameof(propName));
+        if (prop.PropertyType != typeof(bool))
+        {
+            throw new ArgumentException($"Property '{propName}' is not of type bool.", nameof(propName));
+        }
+        prop.SetValue(this, false);
+
+        return $"Property '{propName}' disabled.";
+    }
+
+    [InteractiveFunction(Description = "查看属性当前的值", Name = "prop-get")]
+    public object? GetPropertyValue([InteractiveParameter(Description = "属性名称", PipeIn = true)] string propName)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(propName, nameof(propName));
+
+        var prop = GetProperty(propName)
+                   ?? throw new ArgumentException($"Property '{propName}' not found.", nameof(propName));
+        var value = prop.GetValue(this);
+
+        return value;
+    }
+
+    [InteractiveFunction(Description = "设置属性的值", Name = "prop-set")]
+    public string SetPropertyValue(
+        [InteractiveParameter(Description = "属性名称")] string propName,
+        [InteractiveParameter(Description = "属性值", PipeIn = true)] string valueExpr
+        )
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(propName, nameof(propName));
+        var prop = GetProperty(propName)
+                   ?? throw new ArgumentException($"Property '{propName}' not found.", nameof(propName));
+        var converter = ParameterDeserializer.FromTypeOf(prop.PropertyType)
+                        ?? throw new ArgumentException($"No converter found for property type '{prop.PropertyType.Name}'");
+        try
+        {
+            var value = converter(valueExpr);
+            prop.SetValue(this, value);
+            return $"Property '{prop.Name}' set to '{Convert.ToString(value)}'.";
+        }
+        catch (Exception innerEx)
+        {
+            throw new ArgumentException($"Failed to convert value '{valueExpr}' to type '{prop.PropertyType.Name}'", innerEx);
+        }
+    }
+
+    [InteractiveFunction(Description = "列出所有属性及其当前值", Name = "prop-list")]
+    public object ListProperties(string? propNamePattern = null, bool withValue = false)
+    {
+        if (withValue)
+        {
+            var list = new List<KeyValuePair<string, object?>>();
+            IEnumerable<PropertyInfo> props = GetType().GetProperties(BindingFlags.Public | BindingFlags.Instance);
+
+            if (propNamePattern is not null) props = props.Where(x => x.Name.Contains(propNamePattern, StringComparison.OrdinalIgnoreCase));
+
+            foreach (var prop in props)
+            {
+                var value = prop.GetValue(this);
+                list.Add(new KeyValuePair<string, object?>(prop.Name, value));
+            }
+            return list;
+        }
+        else
+        {
+            return GetType().GetProperties(BindingFlags.Public | BindingFlags.Instance).Select(p => p.Name);
+        }
+    }
+
+    private PropertyInfo? GetProperty(string propName)
+    {
+        return this.GetType().GetProperty(propName, BindingFlags.Public | BindingFlags.Instance | BindingFlags.IgnoreCase);
+    }
+
+    #endregion
+
+    #region Variable Management
+
+    private readonly Dictionary<string, string> _contextlVariables = [];
+
+    [InteractiveFunction(Name = "set", Description = "设置变量的值")]
+    public string SetVariable(
+        [InteractiveParameter(Description = "变量名称，至少1个字符，只能包含字母、数字、下划线")] string name,
+        [InteractiveParameter(Description = "变量值", PipeIn = true)] string value
+        )
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(name, nameof(name));
+        ArgumentNullException.ThrowIfNull(value);
+
+        name = name.Trim();
+
+        if (!name.All(c => char.IsLetterOrDigit(c) || c == '_'))
+        {
+            throw new ArgumentException("Variable name can only contain letters, digits and underscores.", nameof(name));
+        }
+
+        _contextlVariables[name] = value;
+        return value;
+    }
+
+    [InteractiveFunction(Name = "get", Description = "获取变量的值")]
+    public string GetVariable(
+        [InteractiveParameter(Description = "变量名称")] string name
+        )
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(name, nameof(name));
+
+        if (_contextlVariables.TryGetValue(name, out var value))
+        {
+            return value;
+        }
+        else
+        {
+            throw new KeyNotFoundException($"Variable '{name}' not found.");
+        }
+    }
+
+    [InteractiveFunction(Name = "del", Description = "删除变量")]
+    public void DeleteVariable(
+        [InteractiveParameter(Description = "变量名称")] string name
+        )
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(name, nameof(name));
+        if (name.StartsWith("$(") && name.EndsWith(')'))
+        {
+            name = name[2..^1];
+        }
+        if (!_contextlVariables.Remove(name))
+        {
+            throw new KeyNotFoundException($"Variable '{name}' not found.");
+        }
+    }
+
+    #endregion
+
+    #region System Helpers
+
+    [InteractiveFunction(Description = "清除控制台屏幕内容", Name = "cls", Alias = "reset")]
+    public void ClearConsole() => Console.Clear();
+
+    [InteractiveFunction(Description = "获取系统环境变量, 默认检测顺序: 进程>用户>本机", Name = "getx")]
+    public string? GetEnvironmentVariable(
+        [InteractiveParameter(Description = "环境变量名称")] string name,
+        [InteractiveParameter(Description = "作用域: 0=进程/1=用户/2=本机(需要管理员权限)/3=自动")] int target = 3
+
+        )
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(name, nameof(name));
+
+        if (target >= 3 || target < 0)
+        {
+            return Environment.GetEnvironmentVariable(name)
+                // 需要依次检测，虽然系统会为每个进程加载用户和机器的环境变量，但是用户修改了变量后，进程中的值不会更新
+                ?? Environment.GetEnvironmentVariable(name, EnvironmentVariableTarget.User)
+                ?? Environment.GetEnvironmentVariable(name, EnvironmentVariableTarget.Machine);
+        }
+
+        return Environment.GetEnvironmentVariable(name, (EnvironmentVariableTarget)target);
+    }
+
+    [InteractiveFunction(Description = "设置系统环境变量, 作用域: 0=进程/1=用户/2=本机(需要管理员权限)", Name = "setx")]
+    public void SetEnvironmentVariable(
+        [InteractiveParameter(Description = "环境变量名称")] string name,
+        [InteractiveParameter(Description = "环境变量值", PipeIn = true)] string value,
+        [InteractiveParameter(Description = "作用域: 0=进程/1=用户/2=本机(需要管理员权限)", DefaultValueDisplayText = "0")] int target = 0
+        )
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(name, nameof(name));
+        EnvironmentVariableTarget envTarget = target switch
+        {
+            0 => EnvironmentVariableTarget.Process,
+            1 => EnvironmentVariableTarget.User,
+            2 => EnvironmentVariableTarget.Machine,
+            _ => throw new ArgumentOutOfRangeException(nameof(target), "Target must be 0, 1 or 2.")
+        };
+        if (envTarget == EnvironmentVariableTarget.Machine)
+        {
+            // Check for admin rights
+            if (!OperatingSystem.IsWindows())
+            {
+                throw new InvalidOperationException("Setting machine-level environment variables is only supported on Windows.");
+            }
+            var identity = System.Security.Principal.WindowsIdentity.GetCurrent();
+            var principal = new System.Security.Principal.WindowsPrincipal(identity);
+            if (!principal.IsInRole(System.Security.Principal.WindowsBuiltInRole.Administrator))
+            {
+                throw new UnauthorizedAccessException("Setting machine-level environment variables requires administrator privileges.");
+            }
+        }
+        Environment.SetEnvironmentVariable(name, value, envTarget);
+    }
+
+    [InteractiveFunction(Description = "删除系统环境变量, 作用域: 0=进程/1=用户/2=本机(需要管理员权限)", Name = "delx")]
+    public void DeleteEnvironmentVariable(
+        [InteractiveParameter(Description = "环境变量名称")] string name,
+        [InteractiveParameter(Description = "作用域: 0=进程/1=用户/2=本机(需要管理员权限)", DefaultValueDisplayText = "0")] int target = 0
+        )
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(name, nameof(name));
+        EnvironmentVariableTarget envTarget = target switch
+        {
+            0 => EnvironmentVariableTarget.Process,
+            1 => EnvironmentVariableTarget.User,
+            2 => EnvironmentVariableTarget.Machine,
+            _ => throw new ArgumentOutOfRangeException(nameof(target), "Target must be 0, 1 or 2.")
+        };
+        if (envTarget == EnvironmentVariableTarget.Machine)
+        {
+            // Check for admin rights
+            if (!OperatingSystem.IsWindows())
+            {
+                throw new InvalidOperationException("Deleting machine-level environment variables is only supported on Windows.");
+            }
+            var identity = System.Security.Principal.WindowsIdentity.GetCurrent();
+            var principal = new System.Security.Principal.WindowsPrincipal(identity);
+            if (!principal.IsInRole(System.Security.Principal.WindowsBuiltInRole.Administrator))
+            {
+                throw new UnauthorizedAccessException("Deleting machine-level environment variables requires administrator privileges.");
+            }
+        }
+        Environment.SetEnvironmentVariable(name, null, envTarget);
+    }
+
+    #endregion
 }
 
 internal static class DictionaryExtensions
 {
-    public static string FormatPrint(this IEnumerable<KeyValuePair<string, string>> collection)
+    public static string FormatPrint(this IEnumerable<KeyValuePair<string, object?>> collection)
     {
         var sb = new StringBuilder();
         foreach (var kv in collection)
         {
-            sb.AppendLine($"[{kv.Key} = {kv.Value}]");
+            sb.AppendLine($"[{kv.Key} = {Convert.ToString(kv.Value)}]");
         }
         return sb.ToString();
     }

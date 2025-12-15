@@ -1,6 +1,6 @@
 ﻿namespace Interactive.Utilities;
 
-internal class ConsoleHelper
+public class ConsoleHelper
 {
     public static ConsoleHelper Instance { get; } = new ConsoleHelper();
     public string? InputPromptPrefix { get; set; } = "> ";

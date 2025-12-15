@@ -61,6 +61,17 @@ public static class ParameterDeserializer
     public static object? BooleanArray(string parameterExpr) => BooleanEnumerable(parameterExpr) is IEnumerable<bool> parts ? parts.ToArray() : null;
     public static object? BooleanList(string parameterExpr) => BooleanEnumerable(parameterExpr) is IEnumerable<bool> parts ? parts.ToList() : null;
 
+    public static object? Object(string parameterExpr) => parameterExpr;
+    public static object? ObjectEnumerable(string parameterExpr)
+    {
+        var parts = parameterExpr
+            .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Select(x => x.Trim());
+        return parts;
+    }
+    public static object? ObjectArray(string parameterExpr) => ObjectEnumerable(parameterExpr) is IEnumerable<object> parts ? parts.ToArray() : null;
+    public static object? ObjectList(string parameterExpr) => ObjectEnumerable(parameterExpr) is IEnumerable<object> parts ? parts.ToList() : null;
+
     public delegate object? ParamterDeserializer(string parameterExpr);
 
     private static readonly Dictionary<Type, ParamterDeserializer> _typeMap = new()
@@ -89,6 +100,11 @@ public static class ParameterDeserializer
         { typeof(IEnumerable<bool>), BooleanEnumerable },
         { typeof(bool[]), BooleanArray },
         { typeof(List<bool>), BooleanList },
+
+        { typeof(object), Object },
+        { typeof(IEnumerable<object>), ObjectEnumerable },
+        { typeof(object[]), ObjectArray },
+        { typeof(List<object>), ObjectList },
     };
 
     public static ParamterDeserializer? FromTypeOf(Type t)

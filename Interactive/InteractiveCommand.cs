@@ -1,12 +1,13 @@
-﻿using System.Diagnostics.SymbolStore;
+﻿using Interactive.Utilities;
+using System.Diagnostics.SymbolStore;
 
 namespace Interactive;
 
 public class InteractiveCommand
 {
-    public string PrimaryCommand { get; }
+    public string PrimaryCommand { get; private set; }
 
-    public string[] Args { get; }
+    public string[] Args { get; private set; }
 
     const char Quote1 = '"';
     const char Quote2 = '\'';
@@ -20,6 +21,32 @@ public class InteractiveCommand
         PrimaryCommand = primaryCommand;
         Args = args;
         MapArgs();
+    }
+
+    public void MapVariables(IDictionary<string, string> variables, bool allowSearchSystemEnvironment)
+    {
+        VariableHelper.ReplaceOptions options = VariableHelper.ReplaceOptions.RemoveIfNotFound;
+        if (allowSearchSystemEnvironment)
+        {
+            options |= VariableHelper.ReplaceOptions.SearchSystemEnvironment;
+        }
+
+        PrimaryCommand = variables.MapVariables(PrimaryCommand, options);
+        if (Args.Length == 0) return;
+        if (_namedArgs.Count > 0)
+        {
+            foreach (var key in _namedArgs.Keys.ToArray())
+            {
+                _namedArgs[key] = variables.MapVariables(_namedArgs[key], options);
+            }
+        }
+        else
+        {
+            for (int i = 0; i < Args.Length; i++)
+            {
+                Args[i] = variables.MapVariables(Args[i], options);
+            }
+        }
     }
 
     private void MapArgs()
